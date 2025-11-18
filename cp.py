@@ -1442,6 +1442,7 @@ async def games_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("🏠 House Games", callback_data="games_category_house")],
         [InlineKeyboardButton("😀 Emoji Games", callback_data="games_category_emoji")],
+        [InlineKeyboardButton("👥 Official Group", url="https://t.me/+WfJuqjbBYM4wZDBl")],
         [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_to_main")]
     ]
     text = "🎮 <b>Game Categories</b>\n\nChoose a category to see the available games:"
@@ -2980,6 +2981,8 @@ async def bowling_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def play_vs_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE, game_type: str, target_score: int):
     user = update.effective_user
     bet_amount = context.user_data['bet_amount']
+    game_mode = context.user_data.get('game_mode', 'normal')  # normal or crazy
+    game_rolls = context.user_data.get('game_rolls', 1)  # 1, 2, or 3 rolls
     await ensure_user_in_wallets(user.id, user.username, context=context)
 
     if not await check_bet_limits(update, bet_amount, f'pvb_{game_type}'):
@@ -2993,34 +2996,52 @@ async def play_vs_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE, g
 
     game_id = generate_unique_id("PVB")
     emoji_map = {"dice":"🎲", "darts":"🎯", "goal":"⚽", "bowl":"🎳"}
+    
+    mode_text = "Highest total score wins" if game_mode == "normal" else "Lowest total score wins"
 
     await update.message.reply_text(
         f"🎮 {game_type.capitalize()} vs Bot started! (ID: <code>{game_id}</code>)\n"
-        f"First to {target_score} points wins ${bet_amount*2:.2f}.\n"
+        f"<b>Mode:</b> {game_mode.capitalize()} ({mode_text})\n"
+        f"<b>Rolls per round:</b> {game_rolls}\n"
+        f"<b>Target:</b> First to {target_score} points wins ${bet_amount*2:.2f}.\n\n"
         f"Bot is rolling first...",
         parse_mode=ParseMode.HTML
     )
-    await asyncio.sleep(1)  # Rate limit protection
-    try:
-        bot_dice_msg = await context.bot.send_dice(chat_id=update.effective_chat.id, emoji=emoji_map[game_type])
-        bot_roll = bot_dice_msg.dice.value
-        await asyncio.sleep(4)  # Wait for animation to complete
-    except Exception as e:
-        logging.error(f"Error sending dice in play_vs_bot_game: {e}")
-        # Refund the bet on error
-        user_wallets[user.id] += bet_amount
-        save_user_data(user.id)
-        await update.message.reply_text("❌ An error occurred while starting the game. Your bet has been refunded.")
-        return
-
-    await update.message.reply_text(f"Bot rolled {bot_roll}. Now your turn! Send the {emoji_map[game_type]} emoji in this chat.")
+    
+    # Bot rolls multiple times
+    bot_rolls = []
+    for i in range(game_rolls):
+        await asyncio.sleep(1)  # Rate limit protection
+        try:
+            bot_dice_msg = await context.bot.send_dice(chat_id=update.effective_chat.id, emoji=emoji_map[game_type])
+            bot_rolls.append(bot_dice_msg.dice.value)
+            await asyncio.sleep(4)  # Wait for animation to complete
+        except Exception as e:
+            logging.error(f"Error sending dice in play_vs_bot_game: {e}")
+            # Refund the bet on error
+            user_wallets[user.id] += bet_amount
+            save_user_data(user.id)
+            await update.message.reply_text("❌ An error occurred while starting the game. Your bet has been refunded.")
+            return
+    
+    bot_total = sum(bot_rolls)
+    rolls_text = " + ".join(str(r) for r in bot_rolls)
+    await update.message.reply_text(
+        f"Bot rolled: {rolls_text} = <b>{bot_total}</b>\n\n"
+        f"Now your turn! Send {game_rolls} {emoji_map[game_type]} emoji{'s' if game_rolls > 1 else ''} in this chat.",
+        parse_mode=ParseMode.HTML
+    )
 
     game_sessions[game_id] = {
         "id": game_id, "game_type": f"pvb_{game_type}", "user_id": user.id,
         "bet_amount": bet_amount, "status": "active", "timestamp": str(datetime.now(timezone.utc)),
         "target_score": target_score, "current_round": 1,
-        "user_score": 0, "bot_score": 0, "last_bot_roll": bot_roll,
-        "history": [] # To store round results
+        "user_score": 0, "bot_score": 0, 
+        "bot_rolls": bot_rolls,  # Store current bot rolls
+        "user_rolls": [],  # Will store user rolls
+        "game_mode": game_mode,  # normal or crazy
+        "game_rolls": game_rolls,  # number of rolls per round
+        "history": []  # To store round results
     }
     await ensure_user_in_wallets(user.id, user.username, context=context)
     if 'game_sessions' not in user_stats[user.id]: user_stats[user.id]['game_sessions'] = []
@@ -4468,17 +4489,45 @@ async def generic_emoji_game_command(update: Update, context: ContextTypes.DEFAU
     user = update.effective_user
     await ensure_user_in_wallets(user.id, user.username, context=context)
     message_text = update.message.text.strip().split()
-    if len(message_text) != 4:
-        await update.message.reply_text(f"Usage: /{game_type} @username amount ftX\nExample: /{game_type} @opponent 1 ft3")
+    
+    # New format: /dice @username amount MX ftY
+    # M = N (normal) or C (crazy), X = 1, 2, or 3 (rolls)
+    if len(message_text) != 5:
+        await update.message.reply_text(
+            f"<b>Usage:</b> <code>/{game_type} @username amount MX ftY</code>\n\n"
+            f"<b>Parameters:</b>\n"
+            f"• <code>@username</code> - Opponent's username\n"
+            f"• <code>amount</code> - Bet amount (or 'all')\n"
+            f"• <code>MX</code> - Mode and rolls:\n"
+            f"  - <code>N1</code>, <code>N2</code>, <code>N3</code> - Normal mode (1-3 rolls)\n"
+            f"  - <code>C1</code>, <code>C2</code>, <code>C3</code> - Crazy mode (1-3 rolls)\n"
+            f"• <code>ftY</code> - First to Y points\n\n"
+            f"<b>Examples:</b>\n"
+            f"• <code>/{game_type} @player 10 N1 ft3</code>\n"
+            f"• <code>/{game_type} @player 20 C2 ft5</code>",
+            parse_mode=ParseMode.HTML
+        )
         return
 
     opponent_username = normalize_username(message_text[1])
     amount_str = message_text[2].lower()
-    ft_str = message_text[3].lower()
+    mode_rolls_str = message_text[3].upper()
+    ft_str = message_text[4].lower()
 
     if not opponent_username or opponent_username == normalize_username(user.username):
         await update.message.reply_text("Please specify a valid opponent's @username that is not yourself.")
         return
+
+    # Parse mode and rolls (e.g., N1, C2, N3)
+    if len(mode_rolls_str) != 2 or mode_rolls_str[0] not in ['N', 'C'] or mode_rolls_str[1] not in ['1', '2', '3']:
+        await update.message.reply_text(
+            "Invalid mode/rolls format. Use N1-N3 for Normal mode or C1-C3 for Crazy mode.\n"
+            "Example: N1 (Normal, 1 roll), C2 (Crazy, 2 rolls)"
+        )
+        return
+    
+    game_mode = "normal" if mode_rolls_str[0] == 'N' else "crazy"
+    game_rolls = int(mode_rolls_str[1])
 
     if amount_str == "all":
         bet_amount = user_wallets.get(user.id, 0.0)
@@ -4519,6 +4568,7 @@ async def generic_emoji_game_command(update: Update, context: ContextTypes.DEFAU
         return
 
     match_id = generate_unique_id("PVP")
+    mode_text = "Highest total wins" if game_mode == "normal" else "Lowest total wins"
     match_data = {
         "id": match_id, "game_type": f"pvp_{game_type}", "bet_amount": bet_amount, "target_points": target_points,
         "points": {user.id: 0, opponent_id: 0}, "emoji_buffer": {},
@@ -4526,15 +4576,24 @@ async def generic_emoji_game_command(update: Update, context: ContextTypes.DEFAU
         "usernames": {user.id: normalize_username(user.username) or f"ID{user.id}", opponent_id: opponent_username},
         "status": "pending", "last_roller": None,
         "host_id": user.id, "chat_id": update.effective_chat.id,
-        "timestamp": str(datetime.now(timezone.utc))
+        "timestamp": str(datetime.now(timezone.utc)),
+        "game_mode": game_mode,  # normal or crazy
+        "game_rolls": game_rolls,  # 1, 2, or 3
+        "player_rolls": {user.id: [], opponent_id: []},  # Track rolls for each player
     }
     game_sessions[match_id] = match_data
     keyboard = [[InlineKeyboardButton("Accept", callback_data=f"accept_{match_id}"), InlineKeyboardButton("Decline", callback_data=f"decline_{match_id}")]]
 
     sent_message = await update.message.reply_text(
-        f"New {game_type.capitalize()} match request!\nHost: {user.mention_html()} vs Opponent: {opponent_username}\n"
-        f"Bet: ${bet_amount:.2f} | Target: First to {target_points} points.\n"
-        f"{opponent_username}, tap Accept to join the match. (Match ID: <code>{match_id}</code>)",
+        f"🎮 <b>New {game_type.capitalize()} Match Request!</b>\n\n"
+        f"<b>Host:</b> {user.mention_html()}\n"
+        f"<b>Opponent:</b> {opponent_username}\n"
+        f"<b>Bet:</b> ${bet_amount:.2f}\n"
+        f"<b>Mode:</b> {game_mode.capitalize()} ({mode_text})\n"
+        f"<b>Rolls per round:</b> {game_rolls}\n"
+        f"<b>Target:</b> First to {target_points} points\n\n"
+        f"{opponent_username}, tap Accept to join!\n"
+        f"Match ID: <code>{match_id}</code>",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.HTML
     )
@@ -4555,13 +4614,93 @@ async def pvb_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("pvb_start_"):
         game_type = data.replace("pvb_start_", "")
         context.user_data['game_type'] = game_type
-        await query.edit_message_text(f"How much do you want to bet against the bot? (You can also type 'all')", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="cancel_game")]]))
-        return SELECT_BET_AMOUNT
+        
+        # Show mode selection (Normal/Crazy)
+        keyboard = [
+            [InlineKeyboardButton("📊 Normal Mode", callback_data=f"pvb_mode_normal_{game_type}")],
+            [InlineKeyboardButton("🎪 Crazy Mode", callback_data=f"pvb_mode_crazy_{game_type}")],
+            [InlineKeyboardButton("🔙 Cancel", callback_data="cancel_game")]
+        ]
+        await query.edit_message_text(
+            f"🎮 <b>Select Game Mode</b>\n\n"
+            f"<b>Normal Mode:</b> Highest score wins\n"
+            f"<b>Crazy Mode:</b> Lowest score wins",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    elif data.startswith("pvb_mode_"):
+        # Extract mode and game_type from callback data
+        parts = data.split("_")
+        mode = parts[2]  # normal or crazy
+        game_type = "_".join(parts[3:])  # handle game types with underscores
+        context.user_data['game_type'] = game_type
+        context.user_data['game_mode'] = mode
+        
+        # Show roll selection (1/2/3 rolls)
+        keyboard = [
+            [InlineKeyboardButton("1️⃣ 1 Roll", callback_data=f"pvb_rolls_1_{mode}_{game_type}")],
+            [InlineKeyboardButton("2️⃣ 2 Rolls", callback_data=f"pvb_rolls_2_{mode}_{game_type}")],
+            [InlineKeyboardButton("3️⃣ 3 Rolls", callback_data=f"pvb_rolls_3_{mode}_{game_type}")],
+            [InlineKeyboardButton("🔙 Cancel", callback_data="cancel_game")]
+        ]
+        await query.edit_message_text(
+            f"🎮 <b>Select Number of Rolls</b>\n\n"
+            f"Mode: <b>{mode.capitalize()}</b>\n"
+            f"Choose how many times each player will roll:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    elif data.startswith("pvb_rolls_"):
+        # Extract rolls, mode, and game_type from callback data
+        parts = data.split("_")
+        rolls = int(parts[2])  # 1, 2, or 3
+        mode = parts[3]  # normal or crazy
+        game_type = "_".join(parts[4:])  # handle game types with underscores
+        context.user_data['game_type'] = game_type
+        context.user_data['game_mode'] = mode
+        context.user_data['game_rolls'] = rolls
+        
+        # Now call start_pvb_conversation to enter the conversation handler
+        return await start_pvb_conversation_after_setup(query, context)
 
     elif data.startswith("pvp_info_"):
         game_type_map = {"dice_bot": "dice", "football": "goal", "darts": "darts", "bowling": "bowl"}
         game_type = game_type_map.get(data.replace("pvp_info_", ""), "dice")
-        await query.edit_message_text(f"To play against a player, use:\n`/{game_type} @username amount ftX`", parse_mode=ParseMode.MARKDOWN_V2)
+        
+        # Update instructions with new command format
+        await query.edit_message_text(
+            f"🎮 <b>PvP {game_type.capitalize()} Game</b>\n\n"
+            f"<b>Command Format:</b>\n"
+            f"<code>/{game_type} @username amount MX ftY</code>\n\n"
+            f"<b>Parameters:</b>\n"
+            f"• <code>@username</code> - Your opponent's username\n"
+            f"• <code>amount</code> - Bet amount (or 'all')\n"
+            f"• <code>MX</code> - Mode and rolls:\n"
+            f"  - <code>N1</code>, <code>N2</code>, <code>N3</code> - Normal mode (1, 2, or 3 rolls)\n"
+            f"  - <code>C1</code>, <code>C2</code>, <code>C3</code> - Crazy mode (1, 2, or 3 rolls)\n"
+            f"• <code>ftY</code> - First to Y points wins\n\n"
+            f"<b>Examples:</b>\n"
+            f"• <code>/{game_type} @player 10 N1 ft3</code> - Normal mode, 1 roll, first to 3 points\n"
+            f"• <code>/{game_type} @player 20 C2 ft5</code> - Crazy mode, 2 rolls, first to 5 points\n"
+            f"• <code>/{game_type} @player all N3 ft3</code> - Normal mode, 3 rolls, bet all\n\n"
+            f"<b>Mode Explanation:</b>\n"
+            f"• <b>Normal (N):</b> Highest total score wins the point\n"
+            f"• <b>Crazy (C):</b> Lowest total score wins the point",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"game_{data.replace('pvp_info_', '')}")]])
+        )
+
+async def start_pvb_conversation_after_setup(query, context):
+    """Helper function to enter the PvB conversation after mode and roll setup"""
+    await query.edit_message_text(
+        f"Please enter your bet amount for this game (or 'all').",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="cancel_game")]])
+    )
+    return SELECT_BET_AMOUNT
 
 # --- BALANCE COMMAND ---
 @check_maintenance
@@ -4892,34 +5031,72 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
         game_type = game['game_type'].replace("pvb_", "")
         emoji_map = {"dice":"🎲", "darts":"🎯", "goal":"⚽", "bowl":"🎳"}
         expected_emoji = emoji_map[game_type]
+        game_rolls = game.get('game_rolls', 1)
+        game_mode = game.get('game_mode', 'normal')
 
         if update.message.dice and update.message.dice.emoji == expected_emoji:
             user_roll = update.message.dice.value
-            bot_roll = game["last_bot_roll"]
-
+            
+            # Add to user_rolls list
+            if 'user_rolls' not in game:
+                game['user_rolls'] = []
+            game['user_rolls'].append(user_roll)
+            
+            # Check if user has completed all rolls
+            if len(game['user_rolls']) < game_rolls:
+                remaining = game_rolls - len(game['user_rolls'])
+                await update.message.reply_text(f"Roll {len(game['user_rolls'])}/{game_rolls} complete. Send {remaining} more {expected_emoji}!")
+                return
+            
+            # All rolls complete, calculate totals
+            bot_rolls = game.get('bot_rolls', [])
+            user_rolls = game['user_rolls']
+            bot_total = sum(bot_rolls)
+            user_total = sum(user_rolls)
+            
+            bot_rolls_text = " + ".join(str(r) for r in bot_rolls)
+            user_rolls_text = " + ".join(str(r) for r in user_rolls)
+            
+            # Determine winner based on mode
             win = False
-            if game_type in ["dice", "bowl"]: win = user_roll > bot_roll
-            elif game_type == "darts": win = user_roll == 6 or (abs(6-user_roll) < abs(6-bot_roll))
-            elif game_type == "goal":
-                user_scored, bot_scored = user_roll >= 4, bot_roll >= 4
-                if user_scored and not bot_scored: win = True
-                elif user_scored and bot_scored: win = user_roll > bot_roll
-                else: win = False
+            if game_mode == "normal":
+                # Normal mode: highest total wins
+                win = user_total > bot_total
+                tie = user_total == bot_total
+            else:
+                # Crazy mode: lowest total wins
+                win = user_total < bot_total
+                tie = user_total == bot_total
 
-            round_result = {"user": user_roll, "bot": bot_roll, "winner": None}
-            if win:
+            round_result = {"user_rolls": user_rolls, "bot_rolls": bot_rolls, 
+                          "user_total": user_total, "bot_total": bot_total, "winner": None}
+            
+            if tie:
+                await update.message.reply_text(
+                    f"Bot: {bot_rolls_text} = {bot_total}\n"
+                    f"You: {user_rolls_text} = {user_total}\n\n"
+                    f"It's a tie! No point."
+                )
+            elif win:
                 game["user_score"] += 1
                 round_result["winner"] = "user"
-                await update.message.reply_text(f"You rolled {user_roll}, Bot rolled {bot_roll}. You win this round!")
-            elif user_roll == bot_roll:
-                await update.message.reply_text(f"You both rolled {user_roll}. It's a tie! No point.")
+                await update.message.reply_text(
+                    f"Bot: {bot_rolls_text} = {bot_total}\n"
+                    f"You: {user_rolls_text} = {user_total}\n\n"
+                    f"You win this round!"
+                )
             else:
                 game["bot_score"] += 1
                 round_result["winner"] = "bot"
-                await update.message.reply_text(f"You rolled {user_roll}, Bot rolled {bot_roll}. Bot wins this round!")
+                await update.message.reply_text(
+                    f"Bot: {bot_rolls_text} = {bot_total}\n"
+                    f"You: {user_rolls_text} = {user_total}\n\n"
+                    f"Bot wins this round!"
+                )
 
             game["history"].append(round_result)
             game["current_round"] += 1
+            game['user_rolls'] = []  # Reset for next round
 
             # Check for game end
             if game["user_score"] >= game["target_score"]:
@@ -4941,17 +5118,32 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else: # Continue game
                 await asyncio.sleep(0.5)  # Rate limit protection
                 await update.message.reply_text(f"Score: You {game['user_score']} - {game['bot_score']} Bot. (First to {game['target_score']})\nBot is rolling...")
-                await asyncio.sleep(1)  # Rate limit protection
-                try:
-                    next_bot_dice_msg = await context.bot.send_dice(chat_id=update.effective_chat.id, emoji=expected_emoji)
-                    game["last_bot_roll"] = next_bot_dice_msg.dice.value
-                    await asyncio.sleep(4)  # Wait for animation to complete
-                    await update.message.reply_text(f"Bot rolled {next_bot_dice_msg.dice.value}. Your turn!")
-                except Exception as e:
-                    logging.error(f"Error sending dice in PvB game continuation: {e}")
-                    await update.message.reply_text("❌ An error occurred. Game terminated.")
-                    game['status'] = 'error'
-                    del context.chat_data[f"active_pvb_game_{user.id}"]
+                
+                # Bot rolls multiple times for next round
+                bot_rolls = []
+                for i in range(game_rolls):
+                    await asyncio.sleep(1)  # Rate limit protection
+                    try:
+                        next_bot_dice_msg = await context.bot.send_dice(chat_id=update.effective_chat.id, emoji=expected_emoji)
+                        bot_rolls.append(next_bot_dice_msg.dice.value)
+                        await asyncio.sleep(4)  # Wait for animation to complete
+                    except Exception as e:
+                        logging.error(f"Error sending dice in PvB game continuation: {e}")
+                        await update.message.reply_text("❌ An error occurred. Game terminated.")
+                        game['status'] = 'error'
+                        del context.chat_data[f"active_pvb_game_{user.id}"]
+                        update_pnl(user.id)
+                        save_user_data(user.id)
+                        return
+                
+                game["bot_rolls"] = bot_rolls
+                bot_total = sum(bot_rolls)
+                rolls_text = " + ".join(str(r) for r in bot_rolls)
+                await update.message.reply_text(
+                    f"Bot rolled: {rolls_text} = <b>{bot_total}</b>\n\n"
+                    f"Your turn! Send {game_rolls} {expected_emoji}!",
+                    parse_mode=ParseMode.HTML
+                )
             update_pnl(user.id)
             save_user_data(user.id)
         return
@@ -4965,54 +5157,93 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if match_data.get("chat_id") == chat_id and match_data.get("status") == 'active' and user.id in match_data.get("players", []):
                 gtype = match_data.get("game_type", "pvp_dice").replace("pvp_", "")
                 players = match_data["players"]
+                game_rolls = match_data.get("game_rolls", 1)
+                game_mode = match_data.get("game_mode", "normal")
+                
+                # Initialize player_rolls if not exists
+                if "player_rolls" not in match_data:
+                    match_data["player_rolls"] = {players[0]: [], players[1]: []}
+                
                 last_roller = match_data.get("last_roller")
+                
+                # Check turn order
                 if last_roller is None:
                     if user.id != players[0]:
                         await update.message.reply_text("It's not your turn yet! Host should roll first.")
                         return
                 elif user.id == last_roller:
-                    await update.message.reply_text("Wait for your opponent to roll next.")
-                    return
+                    # Check if current player has completed all rolls
+                    if len(match_data["player_rolls"][user.id]) < game_rolls:
+                        # Allow more rolls
+                        pass
+                    else:
+                        await update.message.reply_text("Wait for your opponent to roll next.")
+                        return
+                else:
+                    # Other player's turn, check if they've started rolling
+                    if len(match_data["player_rolls"][user.id]) > 0 and len(match_data["player_rolls"][user.id]) < game_rolls:
+                        # Allow continuing rolls
+                        pass
+                    else:
+                        # Not this player's turn
+                        other_id = [pid for pid in players if pid != user.id][0]
+                        if len(match_data["player_rolls"][other_id]) < game_rolls:
+                            await update.message.reply_text("Wait for your opponent to complete their rolls.")
+                            return
 
                 allowed_emojis = {"dice": "🎲", "darts": "🎯", "goal": "⚽", "bowl": "🎳"}
                 if emoji != allowed_emojis.get(gtype, "🎲"):
                     await update.message.reply_text(f"Only {allowed_emojis.get(gtype)} emoji allowed for this match!")
                     return
 
-                match_data["emoji_buffer"][user.id] = dice_obj.value
+                # Add roll to player's rolls
+                match_data["player_rolls"][user.id].append(dice_obj.value)
                 match_data["last_roller"] = user.id
+                
+                # Check if player has completed their rolls
+                current_player_rolls = len(match_data["player_rolls"][user.id])
+                if current_player_rolls < game_rolls:
+                    remaining = game_rolls - current_player_rolls
+                    await asyncio.sleep(1)
+                    await update.message.reply_text(f"Roll {current_player_rolls}/{game_rolls} complete! Send {remaining} more {emoji}!")
+                    return
 
-                if len(match_data["emoji_buffer"]) == 2:
-                    p1, p2 = players
-                    v1, v2 = match_data["emoji_buffer"].get(p1), match_data["emoji_buffer"].get(p2)
-                    text, winner_id, extra_info = "", None, ""
-
-                    if gtype == "dice":
-                        text += f"{match_data['usernames'][p1]} rolled {v1}, {match_data['usernames'][p2]} rolled {v2}.\n"
-                        if v1 > v2: winner_id = p1
-                        elif v2 > v1: winner_id = p2
-                        else: extra_info = "🤝 It's a tie! No points this round."
-                    elif gtype == "darts":
-                        dist1, dist2 = abs(6 - v1), abs(6 - v2)
-                        text += f"{match_data['usernames'][p1]}: {v1}, {match_data['usernames'][p2]}: {v2}.\n"
-                        if dist1 < dist2: winner_id = p1
-                        elif dist2 < dist1: winner_id = p2
-                        else: extra_info = "🤝 Both hit the same distance! No points."
-                    elif gtype == "goal":
-                        p1_scored, p2_scored = v1 >= 4, v2 >= 4
-                        text += f"{match_data['usernames'][p1]}: {'GOAL!' if p1_scored else 'No Goal'}, {match_data['usernames'][p2]}: {'GOAL!' if p2_scored else 'No Goal'}\n"
-                        if p1_scored and not p2_scored: winner_id = p1
-                        elif p2_scored and not p1_scored: winner_id = p2
-                        elif p1_scored and p2_scored:
-                            if v1 > v2: winner_id = p1
-                            elif v2 > v1: winner_id = p2
-                            else: extra_info = "🤝 Both scored with same power! No winner."
-                        else: extra_info = "🤝 No winner this round."
-                    elif gtype == "bowl":
-                        text += f"{match_data['usernames'][p1]}: {v1} pins, {match_data['usernames'][p2]}: {v2} pins.\n"
-                        if v1 > v2: winner_id = p1
-                        elif v2 > v1: winner_id = p2
-                        else: extra_info = "🤝 Tie!"
+                # Check if both players have completed their rolls
+                p1, p2 = players
+                p1_rolls = match_data["player_rolls"].get(p1, [])
+                p2_rolls = match_data["player_rolls"].get(p2, [])
+                
+                if len(p1_rolls) == game_rolls and len(p2_rolls) == game_rolls:
+                    # Both players completed, calculate results
+                    p1_total = sum(p1_rolls)
+                    p2_total = sum(p2_rolls)
+                    
+                    p1_rolls_text = " + ".join(str(r) for r in p1_rolls)
+                    p2_rolls_text = " + ".join(str(r) for r in p2_rolls)
+                    
+                    text = f"<b>Round Results:</b>\n"
+                    text += f"{match_data['usernames'][p1]}: {p1_rolls_text} = <b>{p1_total}</b>\n"
+                    text += f"{match_data['usernames'][p2]}: {p2_rolls_text} = <b>{p2_total}</b>\n\n"
+                    
+                    winner_id, extra_info = None, ""
+                    
+                    # Determine winner based on mode
+                    if game_mode == "normal":
+                        # Normal mode: highest total wins
+                        if p1_total > p2_total:
+                            winner_id = p1
+                        elif p2_total > p1_total:
+                            winner_id = p2
+                        else:
+                            extra_info = "🤝 It's a tie! No points this round."
+                    else:
+                        # Crazy mode: lowest total wins
+                        if p1_total < p2_total:
+                            winner_id = p1
+                        elif p2_total < p1_total:
+                            winner_id = p2
+                        else:
+                            extra_info = "🤝 It's a tie! No points this round."
 
                     if winner_id:
                         match_data["points"][winner_id] += 1
@@ -5020,7 +5251,7 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         text += extra_info
 
-                    text += f"\n\nScore: {match_data['usernames'][p1]} {match_data['points'][p1]} - {match_data['points'][p2]} {match_data['points'][p2]}"
+                    text += f"\n\n<b>Score:</b> {match_data['usernames'][p1]} {match_data['points'][p1]} - {match_data['points'][p2]} {match_data['points'][p2]}"
 
                     target = match_data["target_points"]
                     final_winner = None
@@ -5042,15 +5273,20 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             except Exception as e: logging.warning(f"Could not unpin message for match {match_id}: {e}")
                     else:
                         match_data["last_roller"] = None
-                        text += f"\n\nNext turn: {match_data['usernames'][p2 if user.id == p1 else p1]} ({allowed_emojis[gtype]} emoji)."
+                        match_data["player_rolls"] = {p1: [], p2: []}  # Reset rolls for next round
+                        text += f"\n\n<b>Next round:</b> {match_data['usernames'][p1]} rolls first! ({allowed_emojis[gtype]} emoji)"
 
-                    match_data["emoji_buffer"] = {}
                     await asyncio.sleep(1.5)
                     await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
                 else:
                     other_id = [pid for pid in players if pid != user.id][0]
-                    await asyncio.sleep(1.5)
-                    await update.message.reply_text(f"Waiting for {match_data['usernames'][other_id]} to play.")
+                    other_rolls = len(match_data["player_rolls"].get(other_id, []))
+                    if other_rolls == 0:
+                        await asyncio.sleep(1)
+                        await update.message.reply_text(f"Your rolls complete! Waiting for {match_data['usernames'][other_id]} to start rolling.")
+                    elif other_rolls < game_rolls:
+                        await asyncio.sleep(1)
+                        await update.message.reply_text(f"Your rolls complete! Waiting for {match_data['usernames'][other_id]} to finish ({other_rolls}/{game_rolls} done).")
                 return
 
 # --- Clear user funds (owner only) ---
@@ -8110,6 +8346,9 @@ async def more_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, page=0):
             row.append(InlineKeyboardButton(all_items[i + 1][0], callback_data=all_items[i + 1][1]))
         keyboard.append(row)
     
+    # Add Terms of Service button
+    keyboard.append([InlineKeyboardButton("📜 Terms of Service", url="https://telegra.ph/Casino-Terms-of-Service-11-17")])
+    
     # Back button
     keyboard.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_to_main")])
     
@@ -8768,7 +9007,11 @@ def main():
     )
 
     pvb_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_pvb_conversation, pattern="^pvb_start_")],
+        entry_points=[
+            CallbackQueryHandler(pvb_menu_callback, pattern="^pvb_start_"),
+            CallbackQueryHandler(pvb_menu_callback, pattern="^pvb_mode_"),
+            CallbackQueryHandler(pvb_menu_callback, pattern="^pvb_rolls_"),
+        ],
         states={
             SELECT_BET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, pvb_get_bet_amount)],
             SELECT_TARGET_SCORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, pvb_get_target_score)],
@@ -8916,7 +9159,7 @@ def main():
     app.add_handler(CallbackQueryHandler(coinchain_callback, pattern=r"^coinchain_")) # NEW - Coin Chain game callbacks
     app.add_handler(CallbackQueryHandler(clear_confirm_callback, pattern=r"^(clear|clearall)_confirm_")); app.add_handler(CallbackQueryHandler(deposit_method_callback, pattern="^deposit_"))
     app.add_handler(CallbackQueryHandler(match_invite_callback, pattern=r"^(accept_|decline_)")); app.add_handler(CallbackQueryHandler(mines_pick_callback, pattern=r"^mines_"))
-    app.add_handler(CallbackQueryHandler(stop_confirm_callback, pattern=r"^stop_confirm_")); app.add_handler(CallbackQueryHandler(pvb_menu_callback, pattern="^(pvb_|pvp_)"))
+    app.add_handler(CallbackQueryHandler(stop_confirm_callback, pattern=r"^stop_confirm_")); app.add_handler(CallbackQueryHandler(pvb_menu_callback, pattern="^pvp_info_"))
     app.add_handler(CallbackQueryHandler(escrow_callback_handler, pattern=r"^escrow_")); app.add_handler(CallbackQueryHandler(users_navigation_callback, pattern=r"^users_"))
     app.add_handler(CallbackQueryHandler(language_callback, pattern=r"^lang_"))
     app.add_handler(CallbackQueryHandler(currency_callback, pattern=r"^setcurrency_")) # NEW - Currency setting
