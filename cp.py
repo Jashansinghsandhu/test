@@ -4664,11 +4664,8 @@ async def pvb_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['game_mode'] = mode
         context.user_data['game_rolls'] = rolls
         
-        await query.edit_message_text(
-            f"Please enter your bet amount for this game (or 'all').",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="cancel_game")]])
-        )
-        return SELECT_BET_AMOUNT
+        # Now call start_pvb_conversation to enter the conversation handler
+        return await start_pvb_conversation_after_setup(query, context)
 
     elif data.startswith("pvp_info_"):
         game_type_map = {"dice_bot": "dice", "football": "goal", "darts": "darts", "bowling": "bowl"}
@@ -4696,6 +4693,14 @@ async def pvb_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"game_{data.replace('pvp_info_', '')}")]])
         )
+
+async def start_pvb_conversation_after_setup(query, context):
+    """Helper function to enter the PvB conversation after mode and roll setup"""
+    await query.edit_message_text(
+        f"Please enter your bet amount for this game (or 'all').",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="cancel_game")]])
+    )
+    return SELECT_BET_AMOUNT
 
 # --- BALANCE COMMAND ---
 @check_maintenance
@@ -9002,7 +9007,11 @@ def main():
     )
 
     pvb_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_pvb_conversation, pattern="^pvb_start_")],
+        entry_points=[
+            CallbackQueryHandler(pvb_menu_callback, pattern="^pvb_start_"),
+            CallbackQueryHandler(pvb_menu_callback, pattern="^pvb_mode_"),
+            CallbackQueryHandler(pvb_menu_callback, pattern="^pvb_rolls_"),
+        ],
         states={
             SELECT_BET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, pvb_get_bet_amount)],
             SELECT_TARGET_SCORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, pvb_get_target_score)],
@@ -9150,7 +9159,7 @@ def main():
     app.add_handler(CallbackQueryHandler(coinchain_callback, pattern=r"^coinchain_")) # NEW - Coin Chain game callbacks
     app.add_handler(CallbackQueryHandler(clear_confirm_callback, pattern=r"^(clear|clearall)_confirm_")); app.add_handler(CallbackQueryHandler(deposit_method_callback, pattern="^deposit_"))
     app.add_handler(CallbackQueryHandler(match_invite_callback, pattern=r"^(accept_|decline_)")); app.add_handler(CallbackQueryHandler(mines_pick_callback, pattern=r"^mines_"))
-    app.add_handler(CallbackQueryHandler(stop_confirm_callback, pattern=r"^stop_confirm_")); app.add_handler(CallbackQueryHandler(pvb_menu_callback, pattern="^(pvb_|pvp_)"))
+    app.add_handler(CallbackQueryHandler(stop_confirm_callback, pattern=r"^stop_confirm_")); app.add_handler(CallbackQueryHandler(pvb_menu_callback, pattern="^pvp_info_"))
     app.add_handler(CallbackQueryHandler(escrow_callback_handler, pattern=r"^escrow_")); app.add_handler(CallbackQueryHandler(users_navigation_callback, pattern=r"^users_"))
     app.add_handler(CallbackQueryHandler(language_callback, pattern=r"^lang_"))
     app.add_handler(CallbackQueryHandler(currency_callback, pattern=r"^setcurrency_")) # NEW - Currency setting
